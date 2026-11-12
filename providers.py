@@ -3,25 +3,103 @@ import json
 import os
 import urllib.error
 import urllib.request
+import re
+import time
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
+    'groq': ('GROQ_API_KEY', 'https://api.groq.com/openai/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
 
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    max_retries = 5
+
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+                **headers
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode('utf-8', errors='replace')
+
+            try:
+                data = json.loads(raw)
+                error = data.get('error', data)
+
+                if isinstance(error, dict):
+                    detail = error.get('message', str(error))
+                    metadata = error.get('metadata')
+
+                    if metadata:
+                        detail += ' | metadata=' + json.dumps(
+                            metadata, ensure_ascii=False
+                        )
+                else:
+                    detail = str(error)
+
+            except (json.JSONDecodeError, AttributeError):
+                detail = raw[:1500] or str(exc.reason)
+
+            # Chỉ tự retry HTTP 429 nếu provider cung cấp thời gian chờ.
+            if exc.code == 429 and attempt < max_retries:
+                match = re.search(
+                    r'Please try again in\s+([\d.]+)\s*s',
+                    detail,
+                    re.IGNORECASE
+                )
+
+                retry_after = exc.headers.get('Retry-After')
+
+                if match:
+                    wait_seconds = float(match.group(1))
+                elif retry_after:
+                    try:
+                        wait_seconds = float(retry_after)
+                    except ValueError:
+                        wait_seconds = None
+                else:
+                    wait_seconds = None
+
+                if wait_seconds is not None:
+                    wait_seconds = max(1, wait_seconds) + 0.5
+
+                    print(
+                        f'[RATE LIMIT] HTTP 429. '
+                        f'Chờ {wait_seconds:.1f}s '
+                        f'rồi thử lại ({attempt + 1}/{max_retries}).'
+                    )
+
+                    time.sleep(wait_seconds)
+                    continue
+
+            raise RuntimeError(
+                f'Provider trả HTTP {exc.code}: {detail}'
+            ) from exc
+
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f'Không kết nối được provider: {exc.reason}'
+            ) from exc
+
+    raise RuntimeError('Đã hết số lần thử lại khi gọi provider.')
+
+
 
 
 class Provider:

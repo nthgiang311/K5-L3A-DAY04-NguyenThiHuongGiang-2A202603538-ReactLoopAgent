@@ -33,7 +33,7 @@ def run_case(case, args):
 
 def main():
     parser = argparse.ArgumentParser(description='Chạy agent và chấm eval 0–100')
-    choices = ['openai', 'gemini', 'anthropic', 'openrouter']
+    choices = ['openai', 'gemini', 'anthropic', 'openrouter', 'groq']
     parser.add_argument('--provider', choices=choices, default=os.getenv('PROVIDER', 'openai'))
     parser.add_argument('--model', default=os.getenv('MODEL'))
     parser.add_argument('--judge-provider', choices=choices, default=os.getenv('JUDGE_PROVIDER'))
@@ -61,22 +61,103 @@ def main():
         item = run_case(case, args)
         print(f"{case['id']}: {item['grade'].get('score')} ({item['grade']['status']})", flush=True)
         return item
+    
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        results = list(pool.map(run_and_print, selected))
-    report = {'summary': summarize(results), 'config': {'provider': args.provider, 'model': args.model,
-              'judge_provider': args.judge_provider, 'judge_model': args.judge_model, 'max_steps': args.max_steps,
-              'dataset': 'bonus' if args.bonus else 'core'}, 'cases': results}
+        new_results = list(pool.map(run_and_print, selected))
+
+    config = {
+        'provider': args.provider,
+        'model': args.model,
+        'judge_provider': args.judge_provider,
+        'judge_model': args.judge_model,
+        'max_steps': args.max_steps,
+        'dataset': 'bonus' if args.bonus else 'core'
+    }
+
+    output_path = Path(args.output)
+
+    # Đọc kết quả cũ nếu file đã tồn tại
+    if output_path.exists():
+        old_report = json.loads(output_path.read_text(encoding='utf-8'))
+
+        if old_report.get('config') != config:
+            parser.error(
+                'Cấu hình không khớp với file kết quả cũ. '
+                'Không thể gộp hai lần chạy khác cấu hình.'
+            )
+
+        results_by_id = {
+            item['id']: item
+            for item in old_report.get('cases', [])
+        }
+    else:
+        results_by_id = {}
+
+    # Thêm hoặc cập nhật kết quả từng case
+    for item in new_results:
+        case_id = item['id']
+        old_item = results_by_id.get(case_id)
+
+        # Không thay kết quả đã chấm điểm bằng một lần chạy chưa chấm được
+        if (
+            old_item is not None
+            and old_item.get('grade', {}).get('score') is not None
+            and item.get('grade', {}).get('score') is None
+        ):
+            print(
+                f'{case_id}: giữ kết quả cũ vì lần chạy mới chưa được chấm điểm.',
+                flush=True
+            )
+            continue
+
+        results_by_id[case_id] = item
+
+    # Sắp xếp theo thứ tự case trong dataset
+    results = [
+        results_by_id[case['id']]
+        for case in cases
+        if case['id'] in results_by_id
+    ]
+
+    report = {
+        'summary': summarize(results),
+        'config': config,
+        'cases': results
+    }
+
     summary = report['summary']
+
     if args.bonus:
-        full_run = not args.case and len(selected) == len(cases)
-        report['summary']['bonus_points_0_15'] = bonus_points(summary['score_0_100'], full_run)
-        print(f"Điểm bonus tham khảo: {summary['bonus_points_0_15']}/15 (chỉ tính khi chấm đủ toàn bộ case).")
-    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    print(f"Điểm: {summary['score_0_100']}/100; đã chấm {summary['scored_cases']}/{summary['total_cases']} case. File: {args.output}")
+        full_run = len(results) == len(cases)
+        report['summary']['bonus_points_0_15'] = bonus_points(
+            summary['score_0_100'], full_run
+        )
+        print(
+            f"Điểm bonus tham khảo: {summary['bonus_points_0_15']}/15 "
+            "(chỉ tính khi chấm đủ toàn bộ case)."
+        )
+
+    output_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8'
+    )
+
+    print(
+        f"Điểm: {summary['score_0_100']}/100; "
+        f"đã chấm {summary['scored_cases']}/{summary['total_cases']} case. "
+        f"Đã lưu {len(results)}/{len(cases)} case vào {args.output}"
+    )
+
     if summary['score_0_100'] is None:
-        print('Chưa có điểm tổng do có case chưa được chấm; xem reason trong file.', file=sys.stderr)
+        print(
+            'Chưa có điểm tổng do có case chưa được chấm; xem reason trong file.',
+            file=sys.stderr
+        )
         return 1
+
     return 0
+
+    
 
 if __name__ == '__main__':
     sys.exit(main())
